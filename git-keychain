@@ -1,0 +1,908 @@
+#!/bin/bash
+
+# git-keychain: manage a set of SSH keys in git repository
+# Copyright (C) 2013 Maciej Delmanowski <drybjed@gmail.com>
+# Homepage: https://github.com/drybjed/git-keychain
+
+
+# This program is free software; you can redistribute
+# it and/or modify it under the terms of the
+# GNU General Public License as published by the Free
+# Software Foundation; either version 2 of the License,
+# or (at your option) any later version.
+#
+# This program is distributed in the hope that it will
+# be useful, but WITHOUT ANY WARRANTY; without even the
+# implied warranty of MERCHANTABILITY or FITNESS FOR A
+# PARTICULAR PURPOSE. See the GNU General Public
+# License for more details.
+#
+# You should have received a copy of the GNU General
+# Public License along with this program; if not,
+# write to the Free Software Foundation, Inc., 59
+# Temple Place, Suite 330, Boston, MA  02111-1307  USA
+#
+# An on-line copy of the GNU General Public License can
+# be downloaded from the FSF web page at:
+# http://www.gnu.org/copyleft/gpl.html
+
+
+set -e
+
+declare -r helptag="###GITKEYCHAINHELP###"
+
+scriptname=$(basename ${0})
+
+command=${1}
+
+function do_usage () {
+	cat <<-EOF
+	Usage: ${scriptname} <command> [<args>]
+
+	Available commands:
+	   init		Initialize new keychain repository
+	   mirror	Clone specified repository to bare repository
+	   update	Update local bare repository
+
+	   new		Create new keychain
+	   checkout	Check out keychain repository into work directory
+	   exists	Test if a given keychain exists
+	   ls		List keychains in the current repository
+	   id		Display commit id of a keychain
+
+	   import	Import ~/.ssh/id_?sa.pub SSH keys into keychain
+	   add		Add specified file into keychain
+
+	   chain	Chain specified keychain into user account
+	   lschain	List chained user accounts
+	   detach	Detach chained keychains from user account
+
+	   deploy	Put SSH keys from keychain into ~/.ssh/authorized_keys
+	   clear	Remove ~/.ssh/authorized_keys (with backup copy)
+
+	See '${scriptname} help <command>' for more information on a specific command.
+	EOF
+}
+
+# No command was given
+[ $# -eq 0 ] && do_usage && exit 0
+
+# Check if we are in git repository for all commands except init, help and usage
+if [ -n "${command}" ] && [[ ! ${command} = "init" ]] && [[ ! ${command} = "mirror" ]] && [[ ! ${command} = "help" ]] && [[ ! ${command} = "usage" ]] ; then
+
+	# git-sh initialization
+	. "$(git --exec-path)/git-sh-setup"
+
+	if $(git rev-parse --git-dir > /dev/null 2>&1) ; then
+		branch_name=$(git symbolic-ref --quiet HEAD)
+		branch_name=${branch_name##refs/heads/}
+		branch_name=${branch_name:-HEAD}
+
+		# Check if we are in a bare repository
+		git_is_bare=$(git rev-parse --is-bare-repository)
+	else
+		echo "${scriptname}: error: not in a git repository" && exit 1
+	fi
+fi
+
+branch_prefix="keychain_"
+chainfile=".gitkeychain"
+
+current_keychain="${branch_name##${branch_prefix}}"
+
+
+function checkout_keychain () {
+	local user=${1}
+	local byuser=""
+
+	# This function requires work tree to work properly
+	require_work_tree_exists
+
+	# Check on what branch we currently are
+	branch_name=$(git symbolic-ref --quiet HEAD)
+	branch_name=${branch_name##refs/heads/}
+	branch_name=${branch_name:-HEAD}
+
+	[ -z "${user}" ] && user=${USER}
+
+	[ "${user}" != "${USER}" ] && byuser=" by ${USER}"
+
+	# Check if there are untracked files
+	if ! $(git ls-files --other --directory --exclude-standard | sed q1 > /dev/null 2>&1) ; then
+		echo "${scriptname}: error: current directory has untracked files" && exit 1
+	fi
+
+	# Check if there are uncommited changes
+	if ! $(git diff --quiet > /dev/null 2>&1 && git diff --cached --quiet > /dev/null 2>&1) ; then
+		echo "${scriptname}: error: current directory has uncommited changes" && exit 1
+	fi
+
+	if ! $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${user}") ; then
+
+		# There is no branch for that user, let's create one
+		git checkout --orphan "${branch_prefix}${user}"
+		git rm -rf --ignore-unmatch .
+		[ "${user}" != "${USER}" ] && byuser=" by ${USER}"
+		commit_message="Initialized ${user}'s SSH keychain${byuser}"
+	else
+
+		# Branch for given user found, switch to it if not on it already
+		[ "${branch_name}" != "${branch_prefix}${user}" ] && git checkout "${branch_prefix}${user}"
+		commit_message="Updated ${user}'s SSH keychain${byuser}"
+	fi
+
+	current_keychain="${user}"
+}
+
+
+function commit_changes () {
+	local message=${@}
+
+	git diff --cached --exit-code > /dev/null 2>&1 || git commit -m "${message}"
+}
+
+
+function do_init () {
+	if [ "${1}" = "${helptag}" ] ; then cat <<-EOF
+		Usage: ${scriptname} init [user]
+
+		Initializes new git repository with keychain for current user.
+		EOF
+		exit 0
+	fi
+
+	local user=${1}
+
+	[ -z "${user}" ] && user=${USER}
+
+	# Do not init existing repositories
+	if ! $(git rev-parse --is-bare-repository > /dev/null 2>&1) ; then
+
+		git init
+
+		# git-sh initialization
+		. "$(git --exec-path)/git-sh-setup"
+
+		checkout_keychain ${user}
+
+		touch ${chainfile}
+		git add ${chainfile}
+
+		commit_changes "${commit_message}"
+	else
+		echo "${scriptname}: error: you are in a git repository" && exit 1
+	fi
+}
+
+
+function do_mirror () {
+	if [ "${1}" = "${helptag}" ] ; then cat <<-EOF
+		Usage: ${scriptname} mirror <url> [path]
+
+		Clones given repository as a bare git repository. If you specify [path],
+		repository will be cloned into that directory.
+		EOF
+		exit 0
+	fi
+
+	local url=${1}
+	local path=${2}
+
+	[ -z "${url}" ] && echo "${scriptname}: error: no URL given" && exit 1
+
+	# Do not work in existing repositories
+	if ! $(git rev-parse --is-bare-repository > /dev/null 2>&1) ; then
+
+		git clone --mirror ${url} ${path}
+	else
+		echo "${scriptname}: error: you are in a git repository" && exit 1
+	fi
+}
+
+
+function do_update () {
+	if [ "${1}" = "${helptag}" ] ; then cat <<-EOF
+		Usage: ${scriptname} update
+
+		Update local mirrored repository
+		EOF
+		exit 0
+	fi
+
+	# Do run in existing non-bare repositories
+	if ! $(git rev-parse --is-bare-repository > /dev/null 2>&1) ; then
+
+		git fetch --all
+	else
+		echo "${scriptname}: error: you are in a non-bare git repository" && exit 1
+	fi
+}
+
+
+function do_new () {
+	if [ "${1}" = "${helptag}" ] ; then cat <<-EOF
+		Usage: ${scriptname} new [user]
+
+		Creates new keychain for current user. if you specify [user], keychain for
+		that user will be created instead.
+		EOF
+		exit 0
+	fi
+
+	# This function requires work tree to work properly
+	require_work_tree_exists
+
+	local user=${1}
+
+	[ -z "${user}" ] && user=${USER}
+
+	checkout_keychain ${user}
+
+	touch ${chainfile}
+	git add ${chainfile}
+
+	commit_changes "${commit_message}"
+}
+
+
+function do_import () {
+	if [ "${1}" = "${helptag}" ] ; then cat <<-EOF
+		Usage: ${scriptname} import [user] [otheruser]
+
+		Import ~/.ssh/id_rsa.pub and/or ~/.ssh/id_dsa.pub of the current user into his
+		keychain (it will be created automatically).
+
+		If you specify [user], his keys will be imported into his own keychain (if you
+		have access to his account).
+
+		If you specify [otheruser], keys of the specified [user] will be imported into
+		[otheruser]'s keychain.
+		EOF
+		exit 0
+	fi
+
+	local user=${1}
+	local keychain=${2}
+
+	[ -z "${user}" ] && user=${USER}
+	[ -z "${keychain}" ] && keychain=${user}
+
+	# This function requires work tree to work properly
+	require_work_tree_exists
+
+	# Abort, if specified user doesn't exist
+	if ! $(id -u ${user} > /dev/null 2>&1) ; then
+		echo "${scriptname}: error: user ${user} not found" && exit 1
+	fi
+
+	keyfile_rsa=$(eval echo ~${user}/.ssh/id_rsa.pub)
+	keyfile_dsa=$(eval echo ~${user}/.ssh/id_dsa.pub)
+
+	filename_rsa="${HOSTNAME}-${user}-$(basename ${keyfile_rsa})"
+	filename_dsa="${HOSTNAME}-${user}-$(basename ${keyfile_dsa})"
+
+	# File does not exist
+	[ ! -e ${keyfile_rsa} -a ! -e ${keyfile_dsa} ] && echo "${scriptname}: error: cannot add ${user}'s keyfile: no such file or directory" && exit 1
+	[ ! -r ${keyfile_rsa} -a ! -r ${keyfile_dsa} ] && echo "${scriptname}: error: cannot add ${user}'s keyfile: access denied" && exit 1
+
+	checkout_keychain ${keychain}
+
+	if [ -r ${keyfile_rsa} ] && $(ssh-keygen -l -f ${keyfile_rsa} > /dev/null 2>&1) ; then
+		cat ${keyfile_rsa} > "${filename_rsa}"
+		git add "${filename_rsa}"
+	fi
+	if [ -r ${keyfile_dsa} ] && $(ssh-keygen -l -f ${keyfile_dsa} > /dev/null 2>&1) ; then
+		cat ${keyfile_dsa} > "${filename_dsa}"
+		git add "${filename_dsa}"
+	fi
+
+	# Another user makes the changes
+	[ "${keychain}" != "${USER}" ] && byuser=" by ${USER}"
+
+	commit_message="Imported ${user}'s keys into ${keychain}'s keychain${byuser}"
+
+	commit_changes "${commit_message}"
+}
+
+
+function do_add () {
+	if [ "${1}" = "${helptag}" ] ; then cat <<-EOF
+		Usage: ${scriptname} add [file | user] [otheruser]
+
+		Add specified [file] to keychain of the current user (it will be checked by
+		ssh-keygen -l to test if it's a public key). If you don't specify [file],
+		~/.ssh/authorized_keys is assumed as default.
+
+		If you specify valid [user], his ~/.ssh/authorized_keys will be added to his
+		keychain.
+
+		If you specify [otheruser] after [file] or [user], that file or that user's
+		~/.ssh/authorized_keys will be added to [otheruser]'s keychain.
+		EOF
+		exit 0
+	fi
+
+	local file=${1}
+	local keychain=${2}
+
+	# This function requires work tree to work properly
+	require_work_tree_exists
+
+	# If file isn't specified, assume current user
+	[ -z "${file}" ] && file=${USER}
+
+	# If keychain isn't specified, assume current user
+	[ -z "${keychain}" ] && keychain=${USER}
+
+	filename=$(basename ${file})
+
+	# If specified file doesn't exist, check if it's an username
+	if [ -n "${file}" -a ! -r ${file} ] ; then
+
+		user=${file}
+
+		# Add information which username added the file
+		[ "${user}" != "${USER}" ] && byuser="${USER}-added-"
+
+		# If user exists, assume we want his authorized_keys
+		if $(id -u ${user} > /dev/null 2>&1) ; then
+			file=$(eval echo ~${file}/.ssh/authorized_keys)
+			filename=$(basename ${file})
+			commitfilename="${HOSTNAME}-${byuser}${user}-$(basename ${file})"
+		else
+			echo "${scriptname}: error: user or file ${file} not found" && exit 1
+		fi
+	fi
+
+	[ -z "${commitfilename}" ] && commitfilename="${HOSTNAME}-${USER}-added-$(basename ${file})"
+
+	# File does not exist
+	[ ! -e ${file} ] && echo "${scriptname}: error: cannot add ${file} to ${keychain}'s keychain: no such file or directory" && exit 1
+	# File exists but we cannot read it
+	[ -e ${file} -a ! -r ${file} ] && echo "${scriptname}: error: cannot add ${file} to ${keychain}'s keychain: access denied" && exit 1
+
+	checkout_keychain ${keychain}
+
+	if [ -r ${file} ] && $(ssh-keygen -l -f ${file} > /dev/null 2>&1) ; then
+		cat ${file} > "${commitfilename}"
+		git add "${commitfilename}"
+	else
+		echo "${scriptname}: error: ${file} is not a public key file" && exit 1
+	fi
+
+	# Another user makes the changes
+	[ "${keychain}" != "${USER}" ] && byuser=" by ${USER}"
+
+	commit_message="Added ${filename} to ${keychain}'s keychain${byuser}"
+
+	commit_changes "${commit_message}"
+}
+
+
+function do_chain () {
+	if [ "${1}" = "${helptag}" ] ; then cat <<-EOF
+		Usage: ${scriptname} chain <user> [otheruser]
+
+		Specified <user>'s keychain will be written into .gitkeychain file of the
+		currently checked out keychain. On the next 'git keychain deploy', <user>'s
+		keychain contents will be added to the current keychain's owner account.
+
+		If you specify [otheruser] after <user>, <user>'s keychain contents will be
+		added to [otheruser]'s account instead.
+
+		Chains can be only one level long. You can use chains to create "group
+		accounts" that don't have SSH public keys themselves, but pull them from other
+		keychains in the repository. To use these "group accounts" without their own
+		user account, use 'git keychain deploy group_account otheruser'.
+		EOF
+		exit 0
+	fi
+
+	local user=${1}
+	local keychain=${2}
+
+	# This function requires work tree to work properly
+	require_work_tree_exists
+
+	# another user makes the chain
+	[ "${current_keychain}" != "${USER}" ] && byuser=" by ${USER}"
+
+	# If user isn't specified, return with error
+	if [ -z "${user}" ] ; then
+
+		echo "${scriptname}: error: you need to specify keychain you want to chain" && exit 1
+
+	# User is specified
+	elif [ -n "${user}" ] ; then
+
+		# Keychain was not specified
+		if [ -z "${keychain}" ] ; then
+
+			# If specified user is the same as current keychain, abort
+			[ "${user}" = "${current_keychain}" ] && echo "${scriptname}: error: user ${user} cannot chain to ${current_keychain}" && exit 1
+			# If keychain does not exist, abort
+			if ! $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${user}") ; then
+				echo "${scriptname}: error: no keychain named '${user}'" ; exit 1
+			fi
+
+		# Keychain was specified
+		elif [ -n "${keychain}" ] ; then
+
+			# checkout keychain if it exists, but do not create one if doesn't
+			if $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${keychain}") ; then
+				checkout_keychain ${keychain}
+
+				# another user makes the chain
+				[ "${current_keychain}" != "${USER}" ] && byuser=" by ${USER}" || byuser=""
+				commit_message="SSH keychain of ${user} chained to ${current_keychain}'s account${byuser}"
+			else
+				echo "${scriptname}: error: no keychain named '${keychain}'" ; exit 1
+			fi
+		fi
+
+		if [ -r ${chainfile} ] ; then
+			if ! $(grep "${user}" ${chainfile} > /dev/null 2>&1) ; then
+				echo "${user}" >> ${chainfile}
+				git add ${chainfile}
+			fi
+		else
+			echo "${user}" > ${chainfile}
+			git add ${chainfile}
+		fi
+
+		commit_message="SSH keychain of ${user} chained to ${current_keychain}'s account${byuser}"
+	fi
+
+	commit_changes "${commit_message}"
+}
+
+
+function do_lschain () {
+	if [ "${1}" = "${helptag}" ] ; then cat <<-EOF
+		Usage: ${scriptname} lschain <user>
+
+		List chained user accounts for current keychain. If [user] is specified, list
+		chained accounts for that [user]'s keychain instead.
+		EOF
+		exit 0
+	fi
+
+	local user=${1}
+
+	# User is specified
+	if [ -n "${user}" ] ; then
+
+		# If keychain does not exist, abort
+		if ! $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${user}") ; then
+			echo "${scriptname}: error: no keychain named '${user}'" ; exit 1
+		fi
+
+		# Look for chainfile in specified users' keychain
+		local lschain="${branch_prefix}${user}"
+	else
+		# Look for chainfile in currently active keychain
+		local lschain="${branch_prefix}${current_keychain}"
+	fi
+
+	if $(git rev-parse --verify ${lschain}:${chainfile} > /dev/null 2>&1) ; then
+		git cat-file -p ${lschain}:${chainfile}
+	fi
+}
+
+
+function do_detach () {
+	if [ "${1}" = "${helptag}" ] ; then cat <<-EOF
+		Usage: ${scriptname} detach [user] [otheruser]
+
+		Detaches all chained keychains from currently checked out keychain (removes
+		.gitkeychain).
+
+		If you specify [user], that user's keychain will be detached from current
+		keychain.
+
+		If you specify [otheruser] after [user], [user]'s keychain will be detached
+		from [otheruser]'s keychain instead.
+
+		See also: chain
+		EOF
+		exit 0
+	fi
+
+	local user=${1}
+	local keychain=${2}
+
+	# This function requires work tree to work properly
+	require_work_tree_exists
+
+	# Another user breaks the chain
+	[ "${current_keychain}" != "${USER}" ] && byuser=" by ${USER}"
+
+	# If user isn't specified, detach all chains (remove chainfile)
+	if [ -z "${user}" ] ; then
+
+		[ -r ${chainfile} ] && git rm -f ${chainfile}
+		touch ${chainfile}
+		git add ${chainfile}
+		commit_message="Detached all keychains from ${current_keychain}'s account${byuser}"
+
+	# User is specified
+	elif [ -n "${user}" ] ; then
+
+		# Keychain was not specified
+		if [ -z "${keychain}" ] ; then
+
+			# If specified user is the same as current keychain, abort
+			[ "${user}" = "${current_keychain}" ] && echo "${scriptname}: error: user ${user} cannot detach from ${current_keychain}" && exit 1
+
+		# Keychain was specified
+		elif [ -n "${keychain}" ] ; then
+
+			# checkout keychain if it exists, but do not create one if doesn't
+			if $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${keychain}") ; then
+				checkout_keychain ${keychain}
+
+				# Another user breaks the chain
+				[ "${current_keychain}" != "${USER}" ] && byuser=" by ${USER}"
+				commit_message="Detached ${user}'s keychain from ${current_keychain}'s account${byuser}"
+			else
+				echo "${scriptname}: error: no keychain named '${keychain}'" ; exit 1
+			fi
+		fi
+
+		if [ -r ${chainfile} ] ; then
+			if $(grep "${user}" ${chainfile} > /dev/null 2>&1) ; then
+				sed -i /${user}/d ${chainfile}
+				if [ -s ${chainfile} ] ; then
+					git add ${chainfile}
+				else
+					git rm -f ${chainfile}
+					touch ${chainfile}
+					git add ${chainfile}
+				fi
+
+				commit_message="Detached ${user}'s keychain from ${current_keychain}'s account${byuser}"
+			fi
+		fi
+	fi
+
+	commit_changes "${commit_message}"
+}
+
+
+function do_ls () {
+	if [ "${1}" = ${helptag} ] ; then cat <<-EOF
+		Usage: ${scriptname} ls [prefix]
+
+		List all commited keychains in a repository. If you specify [prefix], only
+		keychains starting with [prefix] will be listed.
+		EOF
+		exit 0
+	fi
+
+	local prefix=${1}
+
+	git branch --list ${branch_prefix}${prefix}* | sed -e "s/^.*${branch_prefix}//"
+}
+
+
+function do_id () {
+	if [ "${1}" = ${helptag} ] ; then cat <<-EOF
+		Usage: ${scriptname} id [user]
+
+		Display last commit id of current user's keychain. If [user] is specified,
+		display his last commit id instead.
+		EOF
+		exit 0
+	fi
+
+	local keychain=${1}
+
+	# If keychain isn't specified, assume current user
+	[ -z "${keychain}" ] && keychain=${USER}
+
+	if $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${keychain}") ; then
+		git rev-parse --short "refs/heads/${branch_prefix}${keychain}"
+	else
+		echo "${scriptname}: error: no keychain named '${keychain}'" && exit 1
+	fi
+}
+
+
+function do_checkout () {
+	if [ "${1}" = ${helptag} ] ; then cat <<-EOF
+		Usage: ${scriptname} checkout [user]
+
+		Check out keychain (branch) of current user. If [user] is specified, check out
+		his keychain instead.
+
+		If you run command '${scriptname} [user]', and if that user's keychain exists
+		and it's not one of script's internal commands, that keychain will be checked
+		out.
+		EOF
+		exit 0
+	fi
+	local keychain=${1}
+
+	# This function requires work tree to work properly
+	require_work_tree_exists
+
+	# If keychain isn't specified, assume current user
+	[ -z "${keychain}" ] && keychain=${USER}
+
+	# checkout keychain if it exists, but do not create one if doesn't
+	if $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${keychain}") ; then
+		checkout_keychain ${keychain}
+	else
+		echo "${scriptname}: error: no keychain named '${keychain}'" ; exit 1
+	fi
+}
+
+
+function do_deploy () {
+	if [ "${1}" = ${helptag} ] ; then cat <<-EOF
+		Usage: ${scriptname} deploy [user] [otheruser]
+
+		Deploy ssh keys of current user to his ~/.ssh/authorized_keys file. All
+		chained keychains will be deployed as well.
+
+		If you specify [user], that user's ssh keys will be deployed onto his account,
+		if you have access.
+
+		If you specify [otheruser] after [user], [user]'s ssh keys will be deployed
+		onto [otheruser]'s account, if you have access.
+
+		See also: chain, detach
+		EOF
+		exit 0
+	fi
+
+	local keychain=${1}
+	local user=${2}
+
+	# If keychain isn't specified, assume current user
+	[ -z "${keychain}" ] && keychain=${USER}
+
+	# Check if keychain exists, abort otherwise
+	if $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${keychain}") ; then
+		keychain_id=$(git rev-parse --short "refs/heads/${branch_prefix}${keychain}")
+	else
+		echo "${scriptname}: error: no keychain named '${keychain}'" && exit 1
+	fi
+
+	# If it's for a different user, make a note and check his file
+	if [ -n "${user}" ] ; then
+
+		# Abort, if specified user doesn't exist
+		if ! $(id -u ${user} > /dev/null 2>&1) ; then
+			echo "${scriptname}: error: user ${user} not found" && exit 1
+		fi
+
+		foruser=" for ${user}"
+
+		dotssh=$(eval echo ~${user}/.ssh)
+		dotsshowner="${user}:${user}"
+		authorized_keys="${dotssh}/authorized_keys"
+	else
+		# Abort, if specified user doesn't exist
+		if ! $(id -u ${keychain} > /dev/null 2>&1) ; then
+			echo "${scriptname}: error: user ${keychain} not found" && exit 1
+		fi
+
+		dotssh=$(eval echo ~${keychain}/.ssh)
+		dotsshowner="${keychain}:${keychain}"
+		authorized_keys="${dotssh}/authorized_keys"
+	fi
+
+	# When root, check if ~/.ssh directory exists, create it if doesn't
+	if [ ${EUID} -eq 0 ] ; then
+		if ! [ -d ${dotssh} -a -w ${dotssh} ] ; then
+			if ! $(mkdir -m 700 -p ${dotssh} > /dev/null 2>&1) ; then
+				echo "${scriptname}: error: cannot create ${dotssh}: access denied" && exit 1
+			fi
+			chown ${dotsshowner} ${dotssh}
+		fi
+	fi
+
+	# Abort if we don't have access to ~/.ssh/
+	[ ! -w ${dotssh} ] && echo "${scriptname}: error: can't write to ${dotssh}: access denied" && exit 1
+
+	# Setup temporary environment
+	scratch=$(mktemp -d)
+	trap "rm -rf ${scratch}" EXIT # IT'S A TRAP!
+
+	temp_authorized_keys="$(mktemp -p ${scratch})"
+	touch ${temp_authorized_keys}
+	cat <<-EOF > ${temp_authorized_keys}
+		#### ${keychain_id} ${keychain} authorized_keys deployed by ${USER}@${HOSTNAME}${foruser} at $(date)
+		EOF
+
+	for file in $(git ls-tree --name-status ${branch_prefix}${keychain}); do
+		if [[ ${file} = ${chainfile} ]] ; then
+			chainfile_exists=true
+			continue
+		fi
+		echo "# ${file}" >> ${temp_authorized_keys}
+		git show ${branch_prefix}${keychain}:${file} >> ${temp_authorized_keys}
+		echo "" >> ${temp_authorized_keys}
+	done
+
+	if [[ "${chainfile_exists}" = "true" ]] ; then
+		temp_chainfile="$(mktemp -p ${scratch})"
+		git show ${branch_prefix}${keychain}:${chainfile} > ${temp_chainfile}
+		while read line; do
+			if $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${line}") ; then
+				#checkout_keychain ${line}
+				line_keychain_id=$(git rev-parse --short "refs/heads/${branch_prefix}${line}")
+				cat <<-EOF >> ${temp_authorized_keys}
+
+					#### ${line_keychain_id} ${line} authorized_keys chained to ${keychain}'s authorized_keys by ${USER}@${HOSTNAME}
+					EOF
+
+				for file in $(git ls-tree --name-status ${branch_prefix}${line}); do
+					if [[ ${file} = ${chainfile} ]] ; then
+						continue
+					fi
+					echo "# ${file}" >> ${temp_authorized_keys}
+					git show ${branch_prefix}${line}:${file} >> ${temp_authorized_keys}
+					echo "" >> ${temp_authorized_keys}
+				done
+			fi
+		done < ${temp_chainfile}
+	fi
+
+	if [ -r ${temp_authorized_keys} ]; then
+		mv ${temp_authorized_keys} ${authorized_keys}
+		sha1sum ${authorized_keys} > ${authorized_keys}.sha1
+		if [ ${EUID} -eq 0 ] ; then
+			chown ${dotsshowner} ${authorized_keys} ${authorized_keys}.sha1
+		fi
+	fi
+	# Temp files will be removed by A TRAP!
+}
+
+
+function do_clear () {
+	if [ "${1}" = ${helptag} ] ; then cat <<-EOF
+		Usage: ${scriptname} clear [user]
+
+		Remove ~/.ssh/authorized_keys file (with a backup copy). If [user] is
+		specified, remove his ~/.ssh/authorized_keys instead.
+		EOF
+		exit 0
+	fi
+
+	local user=${1}
+
+	# If user isn't specified, assume current user
+	[ -z "${user}" ] && user=${USER}
+
+	# Abort, if specified user doesn't exist
+	if ! $(id -u ${user} > /dev/null 2>&1) ; then
+		echo "${scriptname}: error: user ${user} not found" && exit 1
+	fi
+
+	dotssh=$(eval echo ~${user}/.ssh)
+	dotsshowner="${user}:${user}"
+	authorized_keys="${dotssh}/authorized_keys"
+	authorized_keys_backup="${dotssh}/authorized_keys_backup_$(date +%Y-%m-%d-%H%M%S)_${USER}~"
+
+	# When root, check if ~/.ssh directory exists, create it if doesn't
+	if [ ${EUID} -eq 0 ] ; then
+		if ! [ -d ${dotssh} -a -w ${dotssh} ] ; then
+			if ! $(mkdir -m 700 -p ${dotssh} > /dev/null 2>&1) ; then
+				echo "${scriptname}: error: cannot create ${dotssh}: access denied" && exit 1
+			fi
+			chown ${dotsshowner} ${dotssh}
+		fi
+	fi
+
+	# Abort if we don't have access to ~/.ssh/
+	[ ! -w ${dotssh} ] && echo "${scriptname}: error: can't write to ${dotssh}: access denied" && exit 1
+
+	# Backup ~/.authorized_keys
+	[ -r ${authorized_keys} ] && cp ${authorized_keys} ${authorized_keys_backup}
+
+	if [ ${EUID} -eq 0 ] ; then
+		chown ${dotsshowner} ${authorized_keys_backup}
+	fi
+
+	# Remove authorized_keys
+	rm -f ${authorized_keys} ${authorized_keys}.sha1
+}
+
+
+function do_exists () {
+	if [ "${1}" = "${helptag}" ] ; then cat <<-EOF
+		Usage: ${scriptname} exists [user]
+
+		Check if a keychain for current user exists. Return 0 if exists, 1 if it
+		doesn't. If [user] is specified, check for his keychain instead.
+		EOF
+		exit 0
+	fi
+
+	local keychain=${1}
+
+	# If keychain isn't specified, assume current user
+	[ -z "${keychain}" ] && keychain=${USER}
+
+	if $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${keychain}") ; then
+		exit 0
+	else
+		exit 1
+	fi
+}
+
+
+function do_help () {
+	local topic=${1}
+
+	case "${topic}" in
+		init)		do_init		"${helptag}" ;	exit 0	;;
+		mirror)		do_mirror	"${helptag}" ;	exit 0	;;
+		update)		do_update	"${helptag}" ;	exit 0	;;
+		new)		do_new		"${helptag}" ;	exit 0	;;
+		import)		do_import	"${helptag}" ;	exit 0	;;
+		add)		do_add		"${helptag}" ;	exit 0	;;
+		ls)		do_ls		"${helptag}" ;	exit 0	;;
+		deploy)		do_deploy	"${helptag}" ;	exit 0	;;
+		id)		do_id		"${helptag}" ;	exit 0	;;
+		checkout)	do_checkout	"${helptag}" ;	exit 0	;;
+		clear)		do_clear	"${helptag}" ;	exit 0	;;
+		exists)		do_exists	"${helptag}" ;	exit 0	;;
+		chain)		do_chain	"${helptag}" ;	exit 0	;;
+		lschain)	do_lschain	"${helptag}" ;	exit 0	;;
+		detach)		do_detach	"${helptag}" ;	exit 0	;;
+
+		'')	cat <<-EOF
+			Usage: ${scriptname} help [topic]
+
+			Available topics:
+			Keychain management:	init list id checkout exists
+			SSH key management:	import add deploy chain detach clear
+			EOF
+			exit 0 ;;
+
+		*)	echo "Unknown topic. Try: ${scriptname} help" ; exit 0 ;;
+	esac
+}
+
+
+function do_not_found () {
+	local keychain=${1}
+
+	# We are in a 'normal' repository and keychain with specified name exists
+	if [[ ${git_is_bare} = 'false' ]] && $(git show-ref --verify --quiet "refs/heads/${branch_prefix}${keychain}") ; then
+		checkout_keychain ${keychain}
+	else
+		cat <<-EOF
+		${scriptname}: error: unknown command: $@
+		Try: ${scriptname} usage"
+		EOF
+		exit 1
+	fi
+}
+
+
+# Main script starts here
+case ${command} in
+	init)		shift ;	do_init		${@}	;;
+	mirror)		shift ;	do_mirror	${@}	;;
+	update)		shift ;	do_update		;;
+	new)		shift ;	do_new		${@}	;;
+	import)		shift ;	do_import	${@}	;;
+	add)		shift ;	do_add		${@}	;;
+	chain)		shift ;	do_chain	${@}	;;
+	lschain)	shift ;	do_lschain	${@}	;;
+	detach)		shift ; do_detach	${@}	;;
+	ls)		shift ;	do_ls		${@}	;;
+	id)		shift ;	do_id		${@}	;;
+	checkout)	shift ;	do_checkout	${@}	;;
+	deploy)		shift ;	do_deploy	${@}	;;
+	clear)		shift ;	do_clear	${@}	;;
+	exists)		shift ;	do_exists	${@}	;;
+	help)		shift ; do_help		${@}	;;
+	usage|'')	do_usage && exit 0		;;
+	*)		do_not_found		${@}	;;
+esac
+
